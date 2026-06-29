@@ -1,0 +1,73 @@
+#!/bin/sh
+# agent-jail — confine omp to one directory and watch it live, both in eBPF.
+#
+# One command, one mechanism: a BPF program on the lsm/file_open hook BOTH
+# blocks out-of-bounds opens (-EPERM) and streams every decision to the live
+# dashboard. There is no separate Landlock launcher; enforcement and
+# observation are the same kernel program.
+#
+# Usage:
+#   agent-jail [DIR] [-- omp-args...]   jail omp in DIR (default: cwd)
+#   agent-jail --audit [DIR]            run UNCONFINED, watch what would escape
+#   agent-jail --headless [DIR]         no TUI, stream escape reports to stdout
+#
+# How it scopes: the LSM program enforces on any process whose comm is "omp"
+# (and its children, tracked across fork) confined to DIR. The watcher loads the
+# program and patches DIR before omp starts, so omp is jailed from its first
+# open. Quit the watcher with q.
+#
+# Requires: Linux with CONFIG_BPF_LSM=y and `bpf` in the active LSM list, a BTF
+# kernel, and root for the BPF load. On macOS, run inside the Lima VM.
+set -eu
+
+HERE=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+PROBE_OBJ="$HERE/bin/probe.bpf.o"
+
+MODE=jail
+HEADLESS=""
+DIR=""
+OMP_NAME=${OMP:-omp}
+OMP=$(command -v "$OMP_NAME" 2>/dev/null || echo "$OMP_NAME")
+
+# --- parse flags; everything after -- goes to omp ---
+OMP_ARGS=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --audit|--no-jail) MODE=audit; shift ;;
+    --headless|--background) HEADLESS=1; shift ;;
+    --) shift; OMP_ARGS="$*"; break ;;
+    -h|--help) sed -n '2,18p' "$0"; exit 0 ;;
+    -*) echo "agent-jail: unknown flag $1" >&2; exit 2 ;;
+    *) if [ -z "$DIR" ]; then DIR="$1"; shift; else OMP_ARGS="$*"; break; fi ;;
+  esac
+done
+[ -n "$DIR" ] || DIR=$(pwd)
+DIR=$(CDPATH= cd -- "$DIR" && pwd) # canonical, so the kernel prefix matches
+HOME_ABS=${HOME:-}
+
+[ -f "$PROBE_OBJ" ] || { echo "agent-jail: $PROBE_OBJ missing — run 'make' first" >&2; exit 1; }
+
+echo "agent-jail: $MODE — dir $DIR"
+echo "agent-jail: loading the eBPF jail (needs root); omp starts once it's live."
+
+# Start omp slightly after the watcher, so the LSM program is attached and DIR
+# is patched before omp's first open. The watcher owns the foreground (TUI or
+# headless stream); omp runs in the background, its PID recorded for teardown.
+( sleep 2; eval "exec $OMP $OMP_ARGS" >/dev/null 2>&1 & echo $! > "$HERE/.omp.pid" ) &
+
+# Foreground: the watcher. It loads probe.bpf.o (the LSM jail), patches DIR +
+# comm + mode, and either renders the dashboard or streams headless reports. In
+# audit mode the program emits decisions but never returns -EPERM, so you see
+# what WOULD be blocked with the jail effectively off.
+if [ -n "$HEADLESS" ]; then
+  yeet run "$HERE" -- --dir "$DIR" --mode "$MODE" --home "$HOME_ABS" --comm omp --headless || true
+else
+  yeet run "$HERE" -- --dir "$DIR" --mode "$MODE" --home "$HOME_ABS" --comm omp || true
+fi
+
+# Watcher quit — stop omp if it's still running.
+if [ -f "$HERE/.omp.pid" ]; then
+  OMP_PID=$(cat "$HERE/.omp.pid" 2>/dev/null || true)
+  [ -n "${OMP_PID:-}" ] && kill "$OMP_PID" 2>/dev/null || true
+  rm -f "$HERE/.omp.pid"
+fi
