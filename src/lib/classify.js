@@ -6,13 +6,8 @@
 export const EACCES = 13; // Landlock refuses with -EACCES
 export const EPERM = 1;
 
-// System path prefixes the jail grants read access to so programs can run at
-// all (mirrors SYS_RO_DIRS / SYS_RW_PSEUDO in src/jail/agent-lock.c). An open
-// under these is OUTSIDE the project dir but PERMITTED and benign — loader,
-// libraries, locale, /proc self-inspection. We classify these as "system", not
-// escapes, so the leaderboard shows only genuine reaches at user data instead
-// of being buried under thousands of libc/locale lookups. Keep in sync with
-// the launcher's allow-list.
+// Directory prefixes — everything under these is a benign system read.
+// Mirrors the kernel's sys_prefixes[] in src/bpf/jail.bpf.c.
 const SYSTEM_PREFIXES = [
   "/usr/",
   "/lib/",
@@ -22,7 +17,15 @@ const SYSTEM_PREFIXES = [
   "/dev/",
   "/proc/",
   "/sys/",
-  "/etc/ld.so",
+  "/tmp/",
+];
+
+// Exact system file paths — only the named file is benign, not a longer
+// name sharing the same prefix. Mirrors the kernel's sys_exact[].
+const SYSTEM_EXACT = [
+  "/etc/ld.so.cache",
+  "/etc/ld.so.conf",
+  "/etc/ld.so.preload",
   "/etc/nsswitch.conf",
   "/etc/resolv.conf",
   "/etc/hosts",
@@ -42,11 +45,18 @@ const SCRATCH_DIRS = ["/tmp", "/var/tmp", "/run", "/var/run", "/dev/shm"];
 
 export function isSystemPath(path) {
   if (!path) return false;
+  // Directory prefixes — match everything under them (e.g. "/usr/" matches
+  // "/usr/lib/foo"). All of these end with '/', so they naturally include
+  // the boundary.
   for (const pre of SYSTEM_PREFIXES) {
     if (path.indexOf(pre) === 0) return true;
   }
   for (const pre of SCRATCH_PREFIXES) {
     if (path.indexOf(pre) === 0) return true;
+  }
+  // Exact file matches — only the literal path, not a longer sibling.
+  for (const ex of SYSTEM_EXACT) {
+    if (path === ex) return true;
   }
   // A bare top-level system/scratch directory open (no trailing path) is benign.
   for (const d of SYSTEM_DIRS) {

@@ -93,8 +93,18 @@ else
   pass=$((pass + 1))
 fi
 
+# 9) Prefix-sibling directory — the jail dir is /tmp/agent-lock-adv.
+#    A sibling /tmp/agent-lock-adv2 shares the same prefix. A path filter
+#    that only compares prefix_len bytes would wrongly treat it as in-bounds.
+#    The boundary check in under_prefix() must catch this.
+echo "[9] prefix-sibling directory read"
+SIBLING="/tmp/agent-lock-adv2"
+try "prefix-sibling-rel" "../agent-lock-adv2/secret.txt"
+try "prefix-sibling-abs" "$SIBLING/secret.txt"
+try "prefix-sibling-dir" "$SIBLING"
+
 # cleanup any links we planted (best effort; may be denied, that's fine)
-rm -f ./sneaky_link ./key_link ./hard_passwd 2>/dev/null
+rm -f ./sneaky_link ./key_link ./hard_passwd 2>/dev/null || true
 
 echo "=== adversary done: $pass blocked, $leaks LEAKED ==="
 exit "$leaks"

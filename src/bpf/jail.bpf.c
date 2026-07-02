@@ -68,17 +68,34 @@ struct {
 struct file_event *_unused_event __attribute__((unused));
 
 // System/scratch path prefixes a jailed program may read even though they're
-// outside the project dir: loader, libraries, locale, pseudo-fs, temp. Mirrors
-// the JS classifier's SYSTEM_PREFIXES. Without these, a jailed program can't
-// load libc, and benign locale/loader reads (e.g. /etc/locale.alias that `cat`
-// does) clutter the escape leaderboard instead of being filed as "system".
-// Width is 18 to fit the longest prefix; keep entries <= 17 chars + NUL.
-#define N_SYS 12
+// outside the project dir: loader, libraries, pseudo-fs, temp. Prefixes that
+// end with '/' match everything under that directory; exact file matches for
+// specific /etc paths are in sys_exact[] below. Without these, a jailed program
+// can't load libc, and benign loader reads (e.g. /etc/ld.so.cache on every
+// exec) clutter the escape leaderboard instead of being filed as "system".
+// Width fits the longest prefix + NUL in the allocated columns.
+#define N_SYS 10
 #define SYS_W 16
 static const char sys_prefixes[N_SYS][SYS_W] = {
 	"/usr/", "/lib/", "/lib64/", "/bin/", "/sbin/",
-	"/etc/ld.so", "/etc/locale", "/etc/localtime",
-	"/dev/", "/proc/", "/sys/", "/tmp/",
+	"/etc/localtime", "/dev/", "/proc/", "/sys/", "/tmp/",
+};
+
+// Exact system file paths — matched with is_exact() so only the named file
+// (not a longer name that happens to share a prefix) is treated as a benign
+// system read. These are files the dynamic linker and C library open on every
+// process start; without them, a fixed has_prefix() would no longer classify
+// e.g. "/etc/ld.so.cache" as system, and every exec would flood the
+// leaderboard with noise.
+#define N_SYS_EXACT 6
+#define SYS_EXACT_W 24
+static const char sys_exact[N_SYS_EXACT][SYS_EXACT_W] = {
+	"/etc/ld.so.cache",
+	"/etc/ld.so.conf",
+	"/etc/ld.so.preload",
+	"/etc/nsswitch.conf",
+	"/etc/resolv.conf",
+	"/etc/hosts",
 };
 
 // Does `path` start with `pfx` (a NUL-terminated literal, at most `cap` bytes)?
@@ -87,9 +104,31 @@ static __always_inline int has_prefix(const char *path, const char *pfx, int cap
 #pragma unroll
 	for (int i = 0; i < cap; i++) {
 		char c = pfx[i];
-		if (c == '\0')
-			return 1; // matched the whole prefix
+		if (c == '\0') {
+			// Prefix fully matched. If the prefix itself ends with '/'
+			// (e.g. "/usr/"), the directory boundary is already encoded
+			// and path[i] can be anything. Otherwise (e.g. "/etc/ld.so"),
+			// path[i] must be at a component boundary.
+			if (i > 0 && pfx[i-1] == '/')
+				return 1;
+			char pc = path[i];
+			return (pc == '\0' || pc == '/') ? 1 : 0;
+		}
 		if (path[i] != c)
+			return 0;
+	}
+	return 1;
+}
+
+// Exact string equality within `cap` bytes. Returns 1 only when `path` equals
+// `want` exactly (both reach '\0' at the same position).
+static __always_inline int is_exact(const char *path, const char *want, int cap)
+{
+#pragma unroll
+	for (int i = 0; i < cap; i++) {
+		if (want[i] == '\0')
+			return path[i] == '\0' ? 1 : 0;
+		if (path[i] != want[i])
 			return 0;
 	}
 	return 1;
@@ -118,7 +157,7 @@ static __always_inline int contains(const char *path, const char *needle, int nl
 // processes and must NOT be treated as benign system access.
 static __always_inline int is_sensitive_proc(const char *path)
 {
-	if (!has_prefix(path, "/proc/", 12))
+	if (!has_prefix(path, "/proc/", 8))
 		return 0;
 	return contains(path, "/environ", 8) || contains(path, "/mem", 4) ||
 	       contains(path, "/maps", 5) || contains(path, "/cmdline", 8);
@@ -133,6 +172,11 @@ static __always_inline int is_system_path(const char *path)
 		if (has_prefix(path, sys_prefixes[s], SYS_W))
 			return 1;
 	}
+#pragma unroll
+	for (int s = 0; s < N_SYS_EXACT; s++) {
+		if (is_exact(path, sys_exact[s], SYS_EXACT_W))
+			return 1;
+	}
 	return 0;
 }
 
@@ -144,8 +188,19 @@ static __always_inline int under_prefix(const char *path, const struct jail_cfg 
 		return 0;
 #pragma unroll
 	for (int i = 0; i < PREFIX_MAX; i++) {
-		if ((__u32)i >= n)
-			return 1; // matched the whole prefix
+		if ((__u32)i >= n) {
+			// The prefix matched byte-for-byte. If the prefix itself
+			// ends with '/' (e.g. root "/"), the directory boundary
+			// is already encoded and path[i] can be anything.
+			// Otherwise require a component boundary at path[n] so
+			// a sibling directory with a common prefix (e.g.
+			// /home/u/project2 when jailed in /home/u/project) is
+			// correctly classified as an escape.
+			if (n > 0 && cfg->prefix[n-1] == '/')
+				return 1;
+			char c = path[i];
+			return (c == '\0' || c == '/') ? 1 : 0;
+		}
 		if (path[i] != cfg->prefix[i])
 			return 0;
 	}
