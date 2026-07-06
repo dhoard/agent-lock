@@ -13,6 +13,13 @@ cd "$HERE"
 PROJ=/tmp/agent-lock-adv
 rm -rf "$PROJ"; mkdir -p "$PROJ"
 cp scripts/adversary.sh "$PROJ/adversary.sh"   # must live INSIDE the jail to be read
+# Prefix-sibling directory: a same-prefix directory next to the jail that
+# a naive path-prefix check would allow. The under_prefix() boundary check
+# must refuse this — otherwise "/tmp/agent-lock-adv2" is reachable from
+# "/tmp/agent-lock-adv". This is the escape vector this fix closes.
+SIBLING="${PROJ}2"
+rm -rf "$SIBLING"; mkdir -p "$SIBLING"
+echo "SIBLING_SECRET" > "$SIBLING/secret.txt"
 # decoy secrets the suite reaches for
 mkdir -p "$HOME/.ssh" "$HOME/.aws" 2>/dev/null || true
 [ -f "$HOME/.ssh/id_rsa" ] || printf 'PRIVKEY\n' > "$HOME/.ssh/id_rsa" 2>/dev/null || true
@@ -53,6 +60,6 @@ echo "== running breakout suite as a jailed omp process =="
 RC=$?
 
 kill $HOLDER 2>/dev/null; pkill -9 -f adv-holder 2>/dev/null
-rm -f "$HERE/scripts/adv-holder.js"; rm -rf "$(dirname "$STANDIN")"
+rm -f "$HERE/scripts/adv-holder.js"; rm -rf "$(dirname "$STANDIN")" "$SIBLING"
 echo "  jailed leaks: $RC"
 [ "$RC" -eq 0 ] && echo "PASS: jail held" || { echo "FAIL: $RC leak(s)"; exit 1; }
